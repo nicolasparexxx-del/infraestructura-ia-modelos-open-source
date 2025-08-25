@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-models
+  labels:
+    name: ai-models
+    purpose: ai-infrastructure
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ai-models-quota
+  namespace: ai-models
+spec:
+  hard:
+    requests.cpu: "50"
+    requests.memory: 200Gi
+    requests.nvidia.com/gpu: "10"
+    limits.cpu: "100"
+    limits.memory: 400Gi
+    limits.nvidia.com/gpu: "20"
+    persistentvolumeclaims: "10"
+    services: "20"
+    secrets: "50"
+    configmaps: "50"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: ai-models-limits
+  namespace: ai-models
+spec:
+  limits:
+  - default:
+      cpu: "2"
+      memory: "8Gi"
+      nvidia.com/gpu: "1"
+    defaultRequest:
+      cpu: "500m"
+      memory: "2Gi"
+    type: Container
+  - max:
+      cpu: "16"
+      memory: "64Gi"
+      nvidia.com/gpu: "4"
+    min:
+      cpu: "100m"
+      memory: "128Mi"
+    type: Container
