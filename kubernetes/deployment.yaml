@@ -1,0 +1,427 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-models-api
+  namespace: ai-models
+  labels:
+    app: ai-models-api
+    version: v1
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: ai-models-api
+  template:
+    metadata:
+      labels:
+        app: ai-models-api
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: ai-models-service-account
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: ai-models-api
+        image: ai-models-api:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: MODEL_CACHE_PATH
+          value: "/app/models"
+        - name: HF_HUB_URL
+          value: "https://huggingface.co"
+        - name: DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: ai-models-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: ai-models-secrets
+              key: redis-url
+        - name: API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: ai-models-secrets
+              key: api-token
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: ai-models-secrets
+              key: huggingface-token
+              optional: true
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0,1"
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "2"
+            nvidia.com/gpu: 1
+          limits:
+            memory: "32Gi"
+            cpu: "8"
+            nvidia.com/gpu: 2
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models
+        - name: config-volume
+          mountPath: /app/config
+          readOnly: true
+        - name: tmp-volume
+          mountPath: /tmp
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-storage-pvc
+      - name: config-volume
+        configMap:
+          name: ai-models-config
+      - name: tmp-volume
+        emptyDir:
+          sizeLimit: 10Gi
+      nodeSelector:
+        accelerator: nvidia-gpu
+        node-type: gpu-node
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - ai-models-api
+              topologyKey: kubernetes.io/hostname
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-models-worker
+  namespace: ai-models
+  labels:
+    app: ai-models-worker
+    version: v1
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: ai-models-worker
+  template:
+    metadata:
+      labels:
+        app: ai-models-worker
+        version: v1
+    spec:
+      serviceAccountName: ai-models-service-account
+      containers:
+      - name: ai-models-worker
+        image: ai-models-api:latest
+        command: ["python", "-m", "celery", "worker", "-A", "api.tasks", "--loglevel=info"]
+        env:
+        - name: MODEL_CACHE_PATH
+          value: "/app/models"
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: ai-models-secrets
+              key: redis-url
+        - name: DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: ai-models-secrets
+              key: database-url
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "1"
+            nvidia.com/gpu: 1
+          limits:
+            memory: "16Gi"
+            cpu: "4"
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-storage-pvc
+      nodeSelector:
+        accelerator: nvidia-gpu
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: ai-models
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        args:
+        - redis-server
+        - --appendonly
+        - "yes"
+        - --maxmemory
+        - "2gb"
+        - --maxmemory-policy
+        - "allkeys-lru"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+        volumeMounts:
+        - name: redis-storage
+          mountPath: /data
+        livenessProbe:
+          tcpSocket:
+            port: 6379
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: redis-storage
+        persistentVolumeClaim:
+          claimName: redis-storage-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: ai-models
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: "ai_models_db"
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: ai-models-secrets
+              key: postgres-user
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ai-models-secrets
+              key: postgres-password
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - $(POSTGRES_USER)
+            - -d
+            - $(POSTGRES_DB)
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - $(POSTGRES_USER)
+            - -d
+            - $(POSTGRES_DB)
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-storage-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: ai-models
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus-service-account
+      containers:
+      - name: prometheus
+        image: prom/prometheus:latest
+        ports:
+        - containerPort: 9090
+        args:
+        - '--config.file=/etc/prometheus/prometheus.yml'
+        - '--storage.tsdb.path=/prometheus'
+        - '--web.console.libraries=/etc/prometheus/console_libraries'
+        - '--web.console.templates=/etc/prometheus/consoles'
+        - '--storage.tsdb.retention.time=200h'
+        - '--web.enable-lifecycle'
+        - '--web.enable-admin-api'
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+        volumeMounts:
+        - name: prometheus-config
+          mountPath: /etc/prometheus
+        - name: prometheus-storage
+          mountPath: /prometheus
+      volumes:
+      - name: prometheus-config
+        configMap:
+          name: prometheus-config
+      - name: prometheus-storage
+        persistentVolumeClaim:
+          claimName: prometheus-storage-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: ai-models
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ai-models-secrets
+              key: grafana-admin-password
+        - name: GF_USERS_ALLOW_SIGN_UP
+          value: "false"
+        - name: GF_INSTALL_PLUGINS
+          value: "grafana-kubernetes-app,grafana-piechart-panel"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+        volumeMounts:
+        - name: grafana-storage
+          mountPath: /var/lib/grafana
+        - name: grafana-config
+          mountPath: /etc/grafana/provisioning
+      volumes:
+      - name: grafana-storage
+        persistentVolumeClaim:
+          claimName: grafana-storage-pvc
+      - name: grafana-config
+        configMap:
+          name: grafana-config
